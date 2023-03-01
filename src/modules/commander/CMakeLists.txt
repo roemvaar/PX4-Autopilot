@@ -37,7 +37,8 @@ add_subdirectory(Arming)
 px4_add_module(
 	MODULE modules__commander
 	MAIN commander
-	COMPILE_FLAGS
+	COMPILE_FLAGS -O0
+	#COMPILE_FLAGS
 	SRCS
 		accelerometer_calibration.cpp
 		airspeed_calibration.cpp
