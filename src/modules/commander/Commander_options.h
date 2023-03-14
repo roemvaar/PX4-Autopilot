@@ -43,7 +43,6 @@
  */
 
 #include "Commander.hpp"
-#include "Commander_options.h"
 
 /* commander module headers */
 #include "Arming/PreFlightCheck/PreFlightCheck.hpp"
