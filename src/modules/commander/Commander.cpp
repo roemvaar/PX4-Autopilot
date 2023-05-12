@@ -296,6 +296,37 @@ int Commander::custom_command(int argc, char *argv[])
 		return 0;
 	}
 
+	// Attack Kill Switch
+	if (!strcmp(argv[0], "kill_switch_arm")) {
+		float param2 = 0.f;
+
+		// 21196: force arming/disarming (e.g. allow arming to override preflight checks and disarming in flight)
+		if (argc > 1 && !strcmp(argv[1], "-f")) {
+			param2 = 21196.f;
+		}
+
+		send_vehicle_command(vehicle_command_s::VEHICLE_CMD_COMPONENT_KILL_SWITCH_ARM_DISARM,
+				     static_cast<float>(vehicle_command_s::ARMING_ACTION_ARM),
+				     param2);
+
+		return 0;
+	}
+
+	if (!strcmp(argv[0], "kill_switch_disarm")) {
+		float param2 = 0.f;
+
+		// 21196: force arming/disarming (e.g. allow arming to override preflight checks and disarming in flight)
+		if (argc > 1 && !strcmp(argv[1], "-f")) {
+			param2 = 21196.f;
+		}
+
+		send_vehicle_command(vehicle_command_s::VEHICLE_CMD_COMPONENT_KILL_SWITCH_ARM_DISARM,
+				     static_cast<float>(vehicle_command_s::ARMING_ACTION_DISARM),
+				     param2);
+
+		return 0;
+	}
+
 	if (!strcmp(argv[0], "arm")) {
 		float param2 = 0.f;
 
@@ -521,6 +552,20 @@ static constexpr const char *arm_disarm_reason_str(arm_disarm_reason_t calling_r
 
 	return "";
 };
+
+transition_result_t Commander::kill_switch_arm(arm_disarm_reason_t calling_reason, bool run_preflight_checks)
+{
+	transition_result_t arming_res = arm(calling_reason, run_preflight_checks);
+
+	return arming_res;
+}
+
+transition_result_t Commander::kill_switch_disarm(arm_disarm_reason_t calling_reason, bool forced)
+{
+	transition_result_t arming_res = disarm(calling_reason, forced);
+
+	return arming_res;
+}
 
 using battery_fault_reason_t = events::px4::enums::battery_fault_reason_t;
 static_assert(battery_status_s::BATTERY_FAULT_COUNT == (static_cast<uint8_t>(battery_fault_reason_t::_max) + 1)
@@ -985,7 +1030,62 @@ Commander::handle_command(const vehicle_command_s &cmd)
 
 	/* Waterloo Custom Firmware */
 
-	/* MAV_CMD_COMPONENT_CUSTOM_RECEIVE_HANDLER - 26 */
+	case vehicle_command_s::VEHICLE_CMD_COMPONENT_KILL_SWITCH_ARM_DISARM: {
+
+			// Adhere to MAVLink specs, but base on knowledge that these fundamentally encode ints
+			// for logic state parameters
+			const int8_t arming_action = static_cast<int8_t>(lroundf(cmd.param1));
+
+			if (arming_action != vehicle_command_s::ARMING_ACTION_ARM
+			    && arming_action != vehicle_command_s::ARMING_ACTION_DISARM) {
+				mavlink_log_critical(&_mavlink_log_pub, "Unsupported ARM_DISARM param: %.3f\t", (double)cmd.param1);
+				events::send<float>(events::ID("commander_unsupported_kill_switch_arm_disarm_param"), events::Log::Error,
+						    "Unsupported ARM_DISARM param: {1:.3}", cmd.param1);
+
+			} else {
+				// Arm is forced (checks skipped) when param2 is set to a magic number.
+				const bool forced = (static_cast<int>(lroundf(cmd.param2)) == 21196);
+				const bool cmd_from_io = (static_cast<int>(roundf(cmd.param3)) == 1234);
+
+				if (!forced) {
+					// Flick to in-air restore first if this comes from an onboard system and from IO
+					if (cmd.source_system == _status.system_id && cmd.source_component == _status.component_id
+					    && cmd_from_io && (arming_action == vehicle_command_s::ARMING_ACTION_ARM)) {
+						_status.arming_state = vehicle_status_s::ARMING_STATE_IN_AIR_RESTORE;
+					}
+				}
+
+				transition_result_t arming_res = TRANSITION_DENIED;
+				arm_disarm_reason_t arm_disarm_reason = cmd.from_external ? arm_disarm_reason_t::command_external :
+									arm_disarm_reason_t::command_internal;
+
+				if (arming_action == vehicle_command_s::ARMING_ACTION_ARM) {
+					arming_res = arm(arm_disarm_reason, cmd.from_external || !forced);
+
+				} else if (arming_action == vehicle_command_s::ARMING_ACTION_DISARM) {
+					arming_res = disarm(arm_disarm_reason, forced);
+
+				}
+
+				if (arming_res == TRANSITION_DENIED) {
+					cmd_result = vehicle_command_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED;
+
+				} else {
+					cmd_result = vehicle_command_s::VEHICLE_CMD_RESULT_ACCEPTED;
+
+					/* update home position on arming if at least 500 ms from commander start spent to avoid setting home on in-air restart */
+					if ((arming_action == vehicle_command_s::ARMING_ACTION_ARM) && (arming_res == TRANSITION_CHANGED)
+					    && (hrt_absolute_time() > (_boot_timestamp + INAIR_RESTART_HOLDOFF_INTERVAL))
+					    && (_param_com_home_en.get() && !_home_pub.get().manual_home)) {
+						set_home_position();
+					}
+				}
+			}
+		}
+		break;
+
+
+	/* MAV_CMD_COMPONENT_CUSTOM_RECEIVE_HANDLER - 591 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_RECEIVE_HANDLER:
 		break;
 
@@ -993,7 +1093,7 @@ Commander::handle_command(const vehicle_command_s &cmd)
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_RECEIVE_HANDLER_2:
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_RECEIVE_HANDLER_3 - 28 */
+	/* MAV_CMD_COMPONENT_CUSTOM_RECEIVE_HANDLER_3 - 602 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_RECEIVE_HANDLER_3:
 		break;
 
@@ -1003,7 +1103,7 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		}
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_5 - 36 */
+	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_5 - 363 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_5: {
 		__asm__ ("add r0, r1");
 		__asm__ ("add r0, r1");
@@ -1013,7 +1113,7 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		}
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_10 - 37 */
+	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_10 - 702 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_10: {
 		__asm__ ("add r0, r1");
 		__asm__ ("add r0, r1");
@@ -1028,7 +1128,7 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		}
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_100 - 38 */
+	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_100 - 68 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_100: {
 		__asm__ ("add r0, r1");
 		__asm__ ("add r0, r1");
@@ -1133,7 +1233,7 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		}
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_1000 - 39 */
+	/* MAV_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_1000 - 379 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_NON_MEMORY_ADD_1000: {
 		__asm__ ("add r0, r1");
 		__asm__ ("add r0, r1");
@@ -2138,24 +2238,18 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		}
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_1 - 43 */
+	/* MAV_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_1 - 253 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_1: {
 		/* Load r5 (general) register with the contents of the address pointed by the stack pointer (register 13) */
 		// __asm__ ("ldr r5, [r13]");
 		// __asm__ ("ldr r3, =.bss");
-
 		__asm__ ("ldr r6, =0x20000000");
-
 		}
 		break;
 
 	/* MAV_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_5 - 45 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_5: {
 		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2164,7 +2258,7 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		}
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_10 - 48 */
+	/* MAV_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_10 - 481 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_10: {
 		// __asm__ ("ldr r3, =.bss");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2192,45 +2286,8 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		// 	// __asm__(s);
 		// 	__asm__("ldr r6, =0x_0000000");
 		// }
+		// __asm__ ("ldr r3, =.bss");
 
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
-		// __asm__ ("ldr r3, =.bss");
 		// __asm__ ("ldr r6, =0x20000000");
 		// __asm__ ("ldr r6, =0x20000000");
 		// __asm__ ("ldr r6, =0x20000000");
@@ -2334,9 +2391,8 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		}
 		break;
 
-	/* MAV_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_1000 - 51 */
+	/* MAV_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_1000 - 399 */
 	case vehicle_command_s::VEHICLE_CMD_COMPONENT_CUSTOM_MEMORY_ACCESS_1000: {
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2346,7 +2402,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2356,7 +2411,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2366,7 +2420,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2376,7 +2429,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2386,7 +2438,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2396,7 +2447,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2406,7 +2456,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2416,7 +2465,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2426,7 +2474,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2436,7 +2483,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-						__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2446,7 +2492,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2456,7 +2501,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2466,7 +2510,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2476,7 +2519,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2486,7 +2528,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2496,7 +2537,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2506,7 +2546,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2516,7 +2555,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2526,7 +2564,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2536,7 +2573,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-						__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2546,7 +2582,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2556,7 +2591,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2566,7 +2600,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2576,7 +2609,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2586,7 +2618,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2596,7 +2627,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2606,7 +2636,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2616,7 +2645,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2626,7 +2654,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2636,7 +2663,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-						__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2646,7 +2672,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2656,7 +2681,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2666,7 +2690,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2676,7 +2699,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2686,7 +2708,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2696,7 +2717,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2706,7 +2726,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2716,7 +2735,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2726,7 +2744,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2736,7 +2753,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-						__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2746,7 +2762,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2756,7 +2771,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2766,7 +2780,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2776,7 +2789,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2786,7 +2798,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2796,7 +2807,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2806,7 +2816,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2816,7 +2825,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2826,7 +2834,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2836,7 +2843,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-						__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2846,7 +2852,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2856,7 +2861,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2866,7 +2870,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2876,7 +2879,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2886,7 +2888,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2896,7 +2897,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2906,7 +2906,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2916,7 +2915,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2926,7 +2924,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2936,7 +2933,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-						__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2946,7 +2942,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2956,7 +2951,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -2966,47 +2960,10 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3156,7 +3113,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3166,7 +3122,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3176,7 +3131,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3186,7 +3140,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3196,7 +3149,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3206,7 +3158,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3216,7 +3167,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3226,7 +3176,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3236,7 +3185,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-						__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3246,7 +3194,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3256,7 +3203,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3266,7 +3212,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3276,7 +3221,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3286,7 +3230,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3296,7 +3239,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3306,7 +3248,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3316,7 +3257,6 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
@@ -3326,7 +3266,124 @@ Commander::handle_command(const vehicle_command_s &cmd)
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
-				__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
+		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
 		__asm__ ("ldr r6, =0x20000000");
